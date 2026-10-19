@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>omp 团队会话大厅</title>
+<style>
+	:root {
+		--bg: #0e1116; --surface: #161b22; --surface2: #1c2129; --border: #2d333b; --fg: #e6edf3;
+		--muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922;
+		color-scheme: dark;
+	}
+	* { box-sizing: border-box; }
+	body {
+		margin: 0; background: var(--bg); color: var(--fg);
+		font: 14px/1.5 -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+	}
+	header {
+		display: flex; align-items: baseline; gap: 12px; padding: 18px 24px 12px;
+		border-bottom: 1px solid var(--border);
+	}
+	header h1 { font-size: 18px; margin: 0; }
+	header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); display: inline-block; }
+	header .dot.on { background: var(--ok); }
+	header .meta { color: var(--muted); font-size: 12px; }
+	#grid {
+		display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+		gap: 16px; padding: 20px 24px;
+	}
+	.person {
+		background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+		overflow: hidden;
+	}
+	.person.stale { opacity: 0.45; }
+	.phead {
+		display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+		border-bottom: 1px solid var(--border); background: var(--surface2);
+	}
+	.avatar {
+		width: 36px; height: 36px; border-radius: 50%; flex: none;
+		display: flex; align-items: center; justify-content: center;
+		font-weight: 700; font-size: 15px; color: #fff;
+	}
+	.pname { font-weight: 700; font-size: 15px; }
+	.pstat { color: var(--muted); font-size: 12px; margin-top: 1px; }
+	.pstat.working { color: var(--ok); }
+	.session { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+	.session:last-child { border-bottom: none; }
+	.srow1 { display: flex; align-items: center; gap: 8px; }
+	.sname { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.badge { padding: 1px 8px; border-radius: 10px; font-size: 11px; flex: none; }
+	.badge.working { background: rgba(63,185,80,.15); color: var(--ok); }
+	.badge.idle { background: rgba(139,148,158,.15); color: var(--muted); }
+	.badge.unknown { background: rgba(210,153,34,.15); color: var(--warn); }
+	.badge.offline { background: rgba(248,81,73,.15); color: #f85149; }
+	.srow2 { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+	.sub { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+	a.open { color: var(--accent); text-decoration: none; font-size: 12px; flex: none; }
+	#empty { color: var(--muted); padding: 48px 24px; text-align: center; }
+	code { background: var(--surface); padding: 1px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+	<h1>omp 团队会话大厅</h1>
+	<span class="dot" id="conn"></span>
+	<span class="meta" id="connText">connecting…</span>
+	<span class="meta" id="summary"></span>
+	<span class="meta" style="margin-left:auto" id="updated"></span>
+</header>
+<div id="empty">等待 reporter 上报…(成员机器上启用 <code>collab.autoStart</code> 的会话会出现在这里)</div>
+<div id="grid"></div>
+<script type="module">
+const TEAM_KEY_B64URL = "58moMHwvnco7uLMVasyIV7W4GYyL8qXB9OAb7rnWhM0";
+const ROOM = "lobby-directory-01";
+const MAX_AGE_MS = 20_000;
+// Served by the relay itself: directory room and viewer share this origin.
+const WS_BASE = location.protocol === "https:" ? `wss://${location.host}` : "ws://localhost:7466";
+const VIEWER_BASE = location.protocol === "https:" ? "" : "http://localhost:3000";
+
+const b64u = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+const key = await crypto.subtle.importKey("raw", b64u(TEAM_KEY_B64URL), "AES-GCM", false, ["decrypt"]);
+
+async function unseal(bytes) {
+	const iv = bytes.slice(0, 12);
+	const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, bytes.slice(12));
+	return JSON.parse(new TextDecoder().decode(pt));
+}
+
+const reports = new Map();
+
+function hashHue(name) {
+	let h = 0;
+	for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+	return h % 360;
+}
+
+function render() {
+	const now = Date.now();
+	const grid = document.getElementById("grid");
+	const empty = document.getElementById("empty");
+	grid.innerHTML = "";
+	let people = 0;
+	let sessionsTotal = 0;
+	const sorted = [...reports.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+	for (const [user, r] of sorted) {
+		const fresh = now - r.ts < MAX_AGE_MS;
+		const sessions = fresh ? r.sessions : [];
+		people++;
+		sessionsTotal += sessions.length;
+		const card = document.createElement("div");
+		card.className = "person" + (fresh ? "" : " stale");
+		card.dataset.user = user;
+		const working = sessions.filter(s => s.busy === true);
+		const hue = hashHue(user);
+		const initials = user.slice(0, 2).toUpperCase();
+		let statText;
+		let statClass = "";
+		if (!fresh) {
+			statText = "离线(超过 20s 未上报)";
+		} else if (working.length > 0) {
+			statText = `正在干活 · ${working.length} 个会话运行中`;
+			statClass = "working";
+		} else if (sessions.length > 0) {
+			statText = `${sessions.length} 个会话 · 空闲`;
+		} else {
+			statText = "没有共享会话";
+		}
+		let cardHtml =
+			`<div class="phead">` +
+			`<div class="avatar" style="background:hsl(${hue} 42% 42%)">${initials}</div>` +
+			`<div><div class="pname">${user}</div><div class="pstat ${statClass}">${statText}</div></div>` +
+			`</div>`;
+		for (const s of sessions) {
+			const ageMin = Math.max(0, Math.round((now - s.startedAt) / 60000));
+			const state = !s.relayConnected ? ["offline", "relay 重连中"]
+				: s.busy === null ? ["unknown", "unknown"]
+				: s.busy ? ["working", "working"] : ["idle", "idle"];
+			const rawLink = s.viewLink && s.viewLink.includes("#") ? s.viewLink.slice(s.viewLink.indexOf("#") + 1) : s.viewLink;
+			const openHref = rawLink ? `${VIEWER_BASE}/#${rawLink}` : "";
+			cardHtml +=
+				`<div class="session">` +
+				`<div class="srow1"><span class="sname">${s.name}</span><span class="badge ${state[0]}">${state[1]}</span></div>` +
+				`<div class="srow2"><span class="sub">${s.cwd}${s.model ? " · " + s.model : ""} · ${s.participants} 人</span>` +
+				`<span class="sub" style="flex:none">${ageMin < 1 ? "刚刚" : ageMin + " 分钟前"}</span>` +
+				(openHref ? `<a class="open" href="${openHref}" target="_blank">观看 →</a>` : "") +
+				`</div></div>`;
+		}
+		card.innerHTML = cardHtml;
+		grid.appendChild(card);
+	}
+	const any = people > 0;
+	empty.style.display = any ? "none" : "";
+	document.getElementById("summary").textContent = any ? `${people} 位成员 · ${sessionsTotal} 个共享会话` : "";
+	document.getElementById("updated").textContent = any ? `更新于 ${new Date(now).toLocaleTimeString()}` : "";
+}
+
+const ws = new WebSocket(`${WS_BASE}/r/${ROOM}?role=guest`);
+ws.binaryType = "arraybuffer";
+ws.onopen = () => {
+	document.getElementById("conn").classList.add("on");
+	document.getElementById("connText").textContent = "live";
+};
+ws.onclose = ev => {
+	document.getElementById("conn").classList.remove("on");
+	document.getElementById("connText").textContent = `disconnected (${ev.code})`;
+};
+ws.onmessage = async ev => {
+	if (typeof ev.data === "string") return;
+	const d = new Uint8Array(ev.data);
+	try {
+		const iv = d.slice(4, 16); // strip [4B peerId] envelope prefix
+		const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, d.slice(16));
+		const report = JSON.parse(new TextDecoder().decode(pt));
+		reports.set(report.user, report);
+		render();
+	} catch (e) {
+		document.getElementById("connText").textContent = `decrypt-fail len=${d.length} err=${String(e)}`;
+	}
+};
+setInterval(render, 5000);
+</script>
+</body>
+</html>
